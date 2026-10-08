@@ -1,0 +1,108 @@
+name: Issue 1608 frozen baseline and candidate (keyless)
+
+on:
+  push:
+    branches: [validation/1608-linux-20261008]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - subject: baseline
+            ref: 12ca01f39a1d307b4b6849d671571e5aba46ec8c
+            size_base: b32aae0947622609219aefdd5eda2d08c54bd00a
+          - subject: candidate
+            ref: 635d7e9fc89a3fbc3eda98576f8d70e9aad0c03b
+            size_base: 12ca01f39a1d307b4b6849d671571e5aba46ec8c
+    env:
+      OUROBOROS_PREFLIGHT_REQUIRE_PLUGINS: '1'
+      OUROBOROS_PREFLIGHT_REQUIRE_NODE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify frozen source
+        run: |
+          test "$(git rev-parse HEAD)" = '${{ matrix.ref }}'
+          test -z "$(git status --porcelain --untracked-files=all)"
+          git show -s --format=fuller HEAD
+          git rev-parse 'HEAD^{tree}'
+          sha256sum uv.lock pyproject.toml
+      - uses: ./.github/actions/setup-python-env
+        id: setup_python
+        with:
+          install-project: 'false'
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
+        id: setup_pnpm
+        if: ${{ !cancelled() }}
+        with:
+          version: 11.9.0
+          run_install: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        id: setup_node
+        if: ${{ !cancelled() }}
+        with:
+          node-version: '22'
+      - name: Record runtime versions
+        if: ${{ !cancelled() && steps.setup_python.outcome == 'success' && steps.setup_node.outcome == 'success' }}
+        run: |
+          python --version
+          uv --version
+          node --version
+          pnpm --version
+          python -m pip list --format=freeze
+      - name: Verify generated Pages output
+        if: ${{ !cancelled() && steps.setup_pnpm.outcome == 'success' && steps.setup_node.outcome == 'success' }}
+        run: |
+          pnpm --dir site install --frozen-lockfile
+          pnpm --dir site build
+          test -z "$(git status --porcelain --untracked-files=all -- docs/)"
+          git diff --exit-code -- docs/
+      - name: Lint Python F rules
+        if: ${{ !cancelled() && steps.setup_python.outcome == 'success' }}
+        run: python -m ruff check . --select F
+      - name: Node module tests
+        if: ${{ !cancelled() && steps.setup_node.outcome == 'success' }}
+        run: cd web && node --test tests/*.test.js
+      - name: Browser no-undef lint
+        if: ${{ !cancelled() && steps.setup_node.outcome == 'success' }}
+        run: cd web && npm ci --no-audit --no-fund && npm run lint:undef
+      - name: Parallel default Python lane
+        id: tests_parallel
+        timeout-minutes: 90
+        if: ${{ !cancelled() && steps.setup_python.outcome == 'success' }}
+        run: python -m pytest tests/ -m "not serial and not integration and not browser and not ui_browser and not ui_browser_docker and not portable_detail and not skill_smoke and not size_ratchet" -n auto --dist loadscope --max-worker-restart=0 --timeout=300 --timeout-method=thread -q --tb=short --ci-evidence-dir="${{ runner.temp }}/ci-evidence/parallel"
+      - name: Serial default Python lane
+        id: tests_serial
+        timeout-minutes: 60
+        if: ${{ !cancelled() && steps.setup_python.outcome == 'success' }}
+        run: python -m pytest tests/ -m "serial and not integration and not browser and not ui_browser and not ui_browser_docker and not portable_detail and not skill_smoke and not size_ratchet" -q --tb=short --ci-evidence-dir="${{ runner.temp }}/ci-evidence/serial"
+      - name: Size ratchet
+        id: tests_size
+        timeout-minutes: 20
+        if: ${{ !cancelled() && steps.setup_python.outcome == 'success' }}
+        env:
+          OURO_SIZE_RATCHET_BASE_REF: ${{ matrix.size_base }}
+        run: python -m pytest tests/ -m size_ratchet -q --tb=short --ci-evidence-dir="${{ runner.temp }}/ci-evidence/size"
+      - name: Core transport import guard
+        if: ${{ !cancelled() && steps.setup_python.outcome == 'success' }}
+        run: python -m pytest tests/test_no_core_a2a_telegram_imports.py -q
+      - name: Benchmark methodology
+        if: ${{ !cancelled() && steps.setup_python.outcome == 'success' }}
+        run: python -m pytest tests/test_devtools_benchmarks.py devtools/benchmarks -m "not integration and not browser and not ui_browser and not ui_browser_docker and not portable_detail and not skill_smoke and not size_ratchet" -q --tb=short
+      - name: Publish test evidence
+        if: ${{ !cancelled() && steps.setup_python.outcome == 'success' }}
+        continue-on-error: true
+        uses: ./.github/actions/test-evidence
+        with:
+          name: issue-1608-${{ matrix.subject }}
+          passes: parallel=${{ steps.tests_parallel.outcome }} serial=${{ steps.tests_serial.outcome }} size=${{ steps.tests_size.outcome }}
